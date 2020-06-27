@@ -1,0 +1,70 @@
+## 问题背景
+在项目中我们实现了一个通过浏览器进行外呼的功能，浏览器端我们通过sip.js来与freeswitch进行通信。但是我们发现，在外呼的过程中，我们不能听到类似彩铃或者嘟嘟声来提示正在拨打，业界称之为early media，即早期媒体。sip.js并没有很好的支持这一功能，本文目的在于记录一下如何通过修改源码实现该功能。
+
+## 解决过程
+这个问题在sip.js的issue中也有人问及，不过大家给出的形形色色的解决方案由于版本不一致，可能并不适用。因此需要从原理着手，再去解决这个问题就相对容易很多。之前我写过一篇[sip.js初探](http://bbs.yiwise.com/#/posts/5ca5efd9a814c3225e04fa03)，里面介绍了一些sip和webrtc相关的内容。其实要实现早期媒体，从本质上来说就是在服务端返回183信令的时候，去建立媒体通道即可。不过sip.js遵循了sip协议，在返回2xx时才去建立媒体通道。那么要建立媒体通道，我们仅仅只要在183中获取sdp信息，调用webrtc的setRemoteDescription将其写入客户端即可。因此我们可以参考这个[issue](https://github.com/onsip/SIP.js/pull/502/commits/790df01050d181aa610b9e7b3fcc8d753938c0ea)的实现，sip.js封装了一个setDescription方法，我们仅需将sdp写入即可建立媒体通道。这个issue中有人提了mr来修复这个问题，不过被作者驳回了。作者给出的理由也相当有意思，他举了一个电话可能会被多人抢接的情况。这种情况下由于webrtc中peerconnection的限制，一旦和其中一人建立媒体通道，即接收到sdp并写入本地，此时另一个抢接成功的终端将听不到声音。虽然这种场景不多见，但是作为一个开源库的作者，也不得不赞叹他的这种大局观与责任心。因此我们只能自行去修改源码完成这个功能，继续看issue，作者又给出了一种方案，即sip.js遵循RFC规范，提供了一种100rel的方式来解决这个问题，我们来解释一下这个100rel。
+
+根据sip协议，只有状态为2xx的响应才被认为是reliable的，当客户端收到第一个reliable的响应，才允许建立媒体通道。但是为了解决某些特殊场景需要在1xx就建立媒体通道的情况，RFC由此提出了100rel，顾名思义，将1xx响应也变成reliable的，然后客户端返回PRACK表示收到响应，此时也能建立媒体通道。但是上面提到的问题我们依旧无法解决，即sdp一旦被接收并写入将无法更改。
+因此作者实现此方法时，要求对offer/answer过程做一个逆向操作，a呼叫b，a发送不带sdp的invite，b的不同分支通过服务器回给a的183信息给a传输sdp，a接收sdp后，会发送一个PRACK给服务器，并带上自己的sdp，然后a在收到任何一个分支的200ok时，真正与其建立通话，如果有其他的分支会被抛弃。考虑到目前我们的服务端还未支持这种方式，还是通过源码的方式解决这个问题。
+源码部分如下：
+
+```javascript
+// 这部分代码是处理接收临时信息（101-199）的地方，HaveRemoteOffer状态就是指当前只有远端传来的sdp，本地sdp还没有传给远端
+// 也就是说本地发出的invite不带sdp，收到临时信息后处理远端sdp后会执行到这里，而这里会对early media做处理
+
+// INVITE without Offer and received initial offer in provisional response
+        if (session.signalingState === core_1.SignalingState.HaveRemoteOffer) {
+            // The initial offer MUST be in either an INVITE or, if not there,
+            // in the first reliable non-failure message from the UAS back to
+            // the UAC.
+            // https://tools.ietf.org/html/rfc3261#section-13.2.1
+            // According to Section 13.2.1 of [RFC3261], 'The first reliable
+            // non-failure message' must have an offer if there is no offer in the
+            // INVITE request.  This means that the User Agent (UA) that receives
+            // the INVITE request without an offer must include an offer in the
+            // first reliable response with 100rel extension.  If no reliable
+            // provisional response has been sent, the User Agent Server (UAS) must
+            // include an offer when sending 2xx response.
+            // https://tools.ietf.org/html/rfc6337#section-2.2
+            if (!responseReliable) {
+                this.logger.warn("Non-reliable provisional response MUST NOT contain an initial offer, discarding response.");
+                return;
+            }
+            // If the initial offer is in the first reliable non-failure
+            // message from the UAS back to UAC, the answer MUST be in the
+            // acknowledgement for that message
+            var sdh_2 = this.sessionDescriptionHandlerFactory(this, this.ua.configuration.sessionDescriptionHandlerFactoryOptions || {});
+            this.emit("SessionDescriptionHandler-created", sdh_2);
+            this.earlyMediaSessionDescriptionHandlers.set(session.id, sdh_2);
+            sdh_2
+                .setDescription(response.body, this.sessionDescriptionHandlerOptions, this.modifiers)
+                .then(function () { return sdh_2.getDescription(_this.sessionDescriptionHandlerOptions, _this.modifiers); })
+                .then(function (description) {
+                var body = {
+                    contentDisposition: "session", contentType: description.contentType, content: description.body
+                };
+                inviteResponse.prack({ extraHeaders: extraHeaders, body: body });
+                _this.status = Enums_1.SessionStatus.STATUS_EARLY_MEDIA;
+                _this.emit("progress", response);
+            })
+                .catch(function (error) {
+                if (_this.status === Enums_1.SessionStatus.STATUS_TERMINATED) {
+                    return;
+                }
+                _this.failed(undefined, Constants_1.C.causes.WEBRTC_ERROR);
+                _this.terminated(undefined, Constants_1.C.causes.WEBRTC_ERROR);
+            });
+            return;
+        }
+```
+
+## sdp包含内容
+
+双方的网络地址
+媒体流的传输协议，编解码协议
+ice候选者信息
+
+## PRACK
+ack(acknowledgement, 确认)  用于对2XX信息的确认
+PRACK（Provisional Response ACKnowledgement 临时响应确认） 用于对101-199的临时响应做确认
+[https://blog.csdn.net/pyl88429/article/details/102515751](https://blog.csdn.net/pyl88429/article/details/102515751)
