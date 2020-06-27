@@ -68,3 +68,9 @@ ice候选者信息
 ack(acknowledgement, 确认)  用于对2XX信息的确认
 PRACK（Provisional Response ACKnowledgement 临时响应确认） 用于对101-199的临时响应做确认
 [https://blog.csdn.net/pyl88429/article/details/102515751](https://blog.csdn.net/pyl88429/article/details/102515751)
+
+## UAC/UAS（user agent client/server）
+是根据服务端事务进行区分的，比如建立呼叫和呼叫释放就是两个独立的事务
+一个事务中的发起者就是UAC，接收方是UAS
+比如a呼叫b，在呼叫建立过程中，a是UAC，b是UAS
+呼叫释放时，如果是b主动挂断，那b就是UAC，如果是a主动挂断，那a就是UAC
